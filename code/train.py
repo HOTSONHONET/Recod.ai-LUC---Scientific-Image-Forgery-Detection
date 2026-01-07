@@ -10,6 +10,7 @@ Features:
 import argparse
 import json
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Tuple
@@ -43,16 +44,6 @@ class ForgeryDataset(Dataset):
         self.to_tensor = transforms.ToTensor()
         self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
-        t_list = [transforms.Resize((img_size, img_size))]
-        if augment:
-            t_list.extend(
-                [
-                    transforms.RandomHorizontalFlip(),
-                    transforms.RandomVerticalFlip(),
-                ]
-            )
-        self.img_transform = transforms.Compose(t_list + [self.to_tensor, self.normalize])
-
     def __len__(self) -> int:
         return len(self.df)
 
@@ -78,31 +69,50 @@ class ForgeryDataset(Dataset):
 
         w, h = image.size
         mask_np = self._load_mask(mask_path, target_size=(h, w))
-        image = self.img_transform(image)
-
-        # Resize mask to final size after transforms
         mask_pil = transforms.functional.to_pil_image(mask_np)
-        mask_resized = transforms.functional.resize(mask_pil, (self.img_size, self.img_size), transforms.InterpolationMode.NEAREST)
-        mask_tensor = transforms.functional.to_tensor(mask_resized).float()
+
+        image = transforms.functional.resize(image, (self.img_size, self.img_size))
+        mask_pil = transforms.functional.resize(
+            mask_pil, (self.img_size, self.img_size), transforms.InterpolationMode.NEAREST
+        )
+        if self.augment:
+            if torch.rand(1).item() < 0.5:
+                image = transforms.functional.hflip(image)
+                mask_pil = transforms.functional.hflip(mask_pil)
+            if torch.rand(1).item() < 0.5:
+                image = transforms.functional.vflip(image)
+                mask_pil = transforms.functional.vflip(mask_pil)
+        image = self.normalize(self.to_tensor(image))
+
+        mask_tensor = transforms.functional.to_tensor(mask_pil).float()
         mask_tensor = (mask_tensor > 0.5).float()
 
-        return image, mask_tensor
+        label = float(row.get("label", 0))
+        return image, mask_tensor, torch.tensor(label, dtype=torch.float32)
 
 
-def bce_dice_loss(
-    logits: torch.Tensor, targets: torch.Tensor, smooth: float = 1e-5, pos_weight: float | None = None
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    targets = targets.float()
+def mask_bce_loss(
+    mask_logits: torch.Tensor,
+    targets: torch.Tensor,
+    labels: torch.Tensor,
+    auth_mask_weight: float,
+    pos_weight: float | None = None,
+) -> torch.Tensor:
     pw = None
     if pos_weight is not None:
-        pw = torch.tensor(pos_weight, device=logits.device, dtype=logits.dtype)
-    bce = F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pw)
-    probs = torch.sigmoid(logits)
+        pw = torch.tensor(pos_weight, device=mask_logits.device, dtype=mask_logits.dtype)
+    loss_map = F.binary_cross_entropy_with_logits(mask_logits, targets, pos_weight=pw, reduction="none")
+    per_sample = loss_map.mean(dim=(1, 2, 3))
+    weights = torch.where(labels > 0.5, 1.0, auth_mask_weight).to(per_sample.dtype)
+    return (per_sample * weights).mean()
+
+
+def dice_score(mask_logits: torch.Tensor, targets: torch.Tensor, smooth: float = 1e-5) -> torch.Tensor:
+    probs = torch.sigmoid(mask_logits)
     intersection = (probs * targets).sum(dim=(2, 3))
     union = probs.sum(dim=(2, 3)) + targets.sum(dim=(2, 3))
     dice = (2 * intersection + smooth) / (union + smooth)
-    dice_loss = 1 - dice.mean()
-    return bce + dice_loss, dice.mean()
+    return dice.mean()
 
 
 def train_one_epoch(
@@ -112,6 +122,9 @@ def train_one_epoch(
     scaler: GradScaler | None,
     device: torch.device,
     pos_weight: float | None = None,
+    auth_mask_weight: float = 0.1,
+    mask_loss_weight: float = 1.0,
+    cls_loss_weight: float = 1.0,
 ) -> Tuple[float, float]:
     model.train()
     total_loss = 0.0
@@ -119,14 +132,20 @@ def train_one_epoch(
     count = 0
     use_amp = scaler is not None and scaler.is_enabled()
     device_type = device.type
-    for images, masks in tqdm(loader, desc="Train", leave=False):
+    for images, masks, labels in tqdm(loader, desc="Train", leave=False):
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type=device_type, enabled=use_amp):
-            logits = model(images)
-            loss, dice = bce_dice_loss(logits, masks, pos_weight=pos_weight)
+            mask_logits, class_logits = model(images)
+            mask_loss = mask_bce_loss(
+                mask_logits, masks, labels, auth_mask_weight=auth_mask_weight, pos_weight=pos_weight
+            )
+            cls_loss = F.binary_cross_entropy_with_logits(class_logits.squeeze(1), labels)
+            loss = mask_loss * mask_loss_weight + cls_loss * cls_loss_weight
+            dice = dice_score(mask_logits, masks)
         if use_amp and scaler is not None:
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -142,17 +161,31 @@ def train_one_epoch(
     return total_loss / count, total_dice / count
 
 
-def validate(model: nn.Module, loader: DataLoader, device: torch.device, pos_weight: float | None = None) -> Tuple[float, float]:
+def validate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    pos_weight: float | None = None,
+    auth_mask_weight: float = 0.1,
+    mask_loss_weight: float = 1.0,
+    cls_loss_weight: float = 1.0,
+) -> Tuple[float, float]:
     model.eval()
     total_loss = 0.0
     total_dice = 0.0
     count = 0
     with torch.no_grad():
-        for images, masks in tqdm(loader, desc="Val", leave=False):
+        for images, masks, labels in tqdm(loader, desc="Val", leave=False):
             images = images.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
-            logits = model(images)
-            loss, dice = bce_dice_loss(logits, masks, pos_weight=pos_weight)
+            labels = labels.to(device, non_blocking=True)
+            mask_logits, class_logits = model(images)
+            mask_loss = mask_bce_loss(
+                mask_logits, masks, labels, auth_mask_weight=auth_mask_weight, pos_weight=pos_weight
+            )
+            cls_loss = F.binary_cross_entropy_with_logits(class_logits.squeeze(1), labels)
+            loss = mask_loss * mask_loss_weight + cls_loss * cls_loss_weight
+            dice = dice_score(mask_logits, masks)
             total_loss += loss.item() * images.size(0)
             total_dice += dice.item() * images.size(0)
             count += images.size(0)
@@ -192,6 +225,9 @@ def main():
     parser.add_argument("--output-dir", default=Config.OUTPUT_DIR, help="Where to save model weights.")
     parser.add_argument("--seed", type=int, default=Config.SEED, help="Random seed.")
     parser.add_argument("--pos-weight", type=float, default=None, help="Positive class weight for BCE (e.g., 5.0).")
+    parser.add_argument("--auth-mask-weight", type=float, default=0.1, help="Mask loss weight for authentic images.")
+    parser.add_argument("--mask-loss-weight", type=float, default=1.0, help="Global weight for mask BCE loss.")
+    parser.add_argument("--cls-loss-weight", type=float, default=1.0, help="Global weight for classification BCE loss.")
     args = parser.parse_args()
 
     repo_root = Path(args.repo_root).resolve()
@@ -199,6 +235,9 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = (repo_root / args.output_dir / timestamp).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    cli_args = {"argv": sys.argv, "parsed": vars(args)}
+    with open(output_dir / "cli_args.json", "w", encoding="utf-8") as f:
+        json.dump(cli_args, f, indent=2, sort_keys=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_seed(args.seed)
@@ -206,7 +245,8 @@ def main():
 
     if args.mlflow_uri:
         mlflow.set_tracking_uri(args.mlflow_uri)
-    mlflow.set_experiment(args.experiment_name)
+    experiment_name = f"{args.experiment_name}_{timestamp}"
+    mlflow.set_experiment(experiment_name)
 
     for fold in range(args.n_splits):
         train_df, val_df = load_fold(splits_dir, fold)
@@ -249,9 +289,13 @@ def main():
                     "PRETRAINED": not args.no_pretrained,
                     "SEED": args.seed,
                     "POS_WEIGHT": args.pos_weight,
+                    "AUTH_MASK_WEIGHT": args.auth_mask_weight,
+                    "MASK_LOSS_WEIGHT": args.mask_loss_weight,
+                    "CLS_LOSS_WEIGHT": args.cls_loss_weight,
                 }
             )
             mlflow.log_dict(run_cfg, "config_used.json")
+            mlflow.log_artifact(str(output_dir / "cli_args.json"))
             mlflow.log_params(
                 {
                     "fold": fold,
@@ -262,6 +306,9 @@ def main():
                     "model_name": args.model_name,
                     "pretrained": not args.no_pretrained,
                     "pos_weight": args.pos_weight,
+                    "auth_mask_weight": args.auth_mask_weight,
+                    "mask_loss_weight": args.mask_loss_weight,
+                    "cls_loss_weight": args.cls_loss_weight,
                     "machine_specs": json.dumps({"ram_gb": 64, "cpu_cores": 16, "gpu": "RTX 5070 Ti"}),
                 }
             )
@@ -273,9 +320,25 @@ def main():
 
             for epoch in range(1, args.epochs + 1):
                 train_loss, train_dice = train_one_epoch(
-                    model, train_loader, optimizer, scaler, device, pos_weight=args.pos_weight
+                    model,
+                    train_loader,
+                    optimizer,
+                    scaler,
+                    device,
+                    pos_weight=args.pos_weight,
+                    auth_mask_weight=args.auth_mask_weight,
+                    mask_loss_weight=args.mask_loss_weight,
+                    cls_loss_weight=args.cls_loss_weight,
                 )
-                val_loss, val_dice = validate(model, val_loader, device, pos_weight=args.pos_weight)
+                val_loss, val_dice = validate(
+                    model,
+                    val_loader,
+                    device,
+                    pos_weight=args.pos_weight,
+                    auth_mask_weight=args.auth_mask_weight,
+                    mask_loss_weight=args.mask_loss_weight,
+                    cls_loss_weight=args.cls_loss_weight,
+                )
 
                 metrics = {
                     f"train_loss_fold{fold}": train_loss,

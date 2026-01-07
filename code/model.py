@@ -43,6 +43,7 @@ class DinoSegModel(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(embed_dim // 2, num_classes, kernel_size=1),
         )
+        self.classifier_head = nn.Linear(embed_dim, 1)
 
     def _extract_tokens(self, feats: Any) -> torch.Tensor:
         """
@@ -65,6 +66,11 @@ class DinoSegModel(nn.Module):
         feats = self.backbone.forward_features(images)
         tokens = self._extract_tokens(feats)
 
+        if tokens.shape[1] == (H // self.patch_size) * (W // self.patch_size) + 1:
+            cls_token = tokens[:, 0, :]
+        else:
+            cls_token = tokens.mean(dim=1)
+
         # Drop class token if present.
         if tokens.shape[1] == (H // self.patch_size) * (W // self.patch_size) + 1:
             tokens = tokens[:, 1:, :]
@@ -72,6 +78,7 @@ class DinoSegModel(nn.Module):
         h_tokens = H // self.patch_size
         w_tokens = W // self.patch_size
         tokens = tokens.view(B, h_tokens, w_tokens, -1).permute(0, 3, 1, 2).contiguous()
-        logits = self.decode_head(tokens)
-        logits = F.interpolate(logits, size=(H, W), mode="bilinear", align_corners=False)
-        return logits
+        mask_logits = self.decode_head(tokens)
+        mask_logits = F.interpolate(mask_logits, size=(H, W), mode="bilinear", align_corners=False)
+        class_logits = self.classifier_head(cls_token)
+        return mask_logits, class_logits

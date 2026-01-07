@@ -20,7 +20,7 @@ matplotlib.use("Agg")  # Disable interactive backends for headless runs.
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
 
@@ -161,6 +161,97 @@ def save_dim_heatmap(name: str, widths: list[int], heights: list[int], outdir: P
     return plot_path
 
 
+def align_mask(mask_arr: np.ndarray, target_hw: tuple[int, int]) -> np.ndarray:
+    h_t, w_t = target_hw
+    if mask_arr.shape[:2] != (h_t, w_t) and mask_arr.shape[:2] == (w_t, h_t):
+        mask_arr = np.transpose(mask_arr)
+    if mask_arr.shape[:2] != (h_t, w_t):
+        mask_arr = np.array(
+            Image.fromarray(mask_arr.astype(np.uint8)).resize((w_t, h_t), resample=Image.NEAREST)
+        )
+    return mask_arr
+
+
+def load_mask(mask_path: Path, target_hw: tuple[int, int]) -> np.ndarray:
+    if not mask_path.exists():
+        return np.zeros(target_hw, dtype=np.uint8)
+    arr = np.load(mask_path, allow_pickle=True)
+    if arr.ndim == 3:
+        arr = arr.max(axis=0)
+    mask = (arr > 0).astype(np.uint8) * 255
+    return align_mask(mask, target_hw)
+
+
+def apply_overlay(img_np: np.ndarray, mask_bin: np.ndarray, color=(255, 0, 0), alpha=0.5) -> np.ndarray:
+    overlay = img_np.copy()
+    mask_bool = mask_bin.astype(bool)
+    overlay[mask_bool] = (
+        alpha * np.array(color, dtype=np.float32) + (1 - alpha) * overlay[mask_bool].astype(np.float32)
+    ).astype(np.uint8)
+    return overlay
+
+
+def add_title(img_arr: np.ndarray, title: str, font, title_h: int = 24) -> Image.Image:
+    panel = Image.new("RGB", (img_arr.shape[1], img_arr.shape[0] + title_h), color=(0, 0, 0))
+    panel.paste(Image.fromarray(img_arr), (0, title_h))
+    draw = ImageDraw.Draw(panel)
+    if font:
+        draw.text((5, 4), title, fill=(255, 255, 255), font=font)
+    else:
+        draw.text((5, 4), title, fill=(255, 255, 255))
+    return panel
+
+
+def save_forged_collages(image_dir: Path, mask_dir: Path, outdir: Path, label: str) -> None:
+    if not image_dir.exists():
+        print(f"Missing image dir for {label}: {image_dir}", file=sys.stderr)
+        return
+    if not mask_dir.exists():
+        print(f"Missing mask dir for {label}: {mask_dir}", file=sys.stderr)
+        return
+    outdir.mkdir(parents=True, exist_ok=True)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+
+    image_paths = sorted(p for p in image_dir.iterdir() if p.is_file())
+    for img_path in tqdm(image_paths, desc=f"{label} collages", unit="img"):
+        mask_path = mask_dir / f"{img_path.stem}.npy"
+        if not mask_path.exists():
+            continue
+        try:
+            with Image.open(img_path) as img:
+                img = img.convert("RGB")
+                img_np = np.array(img)
+        except Exception as exc:
+            print(f"Failed to read {img_path}: {exc}", file=sys.stderr)
+            continue
+
+        h, w = img_np.shape[:2]
+        mask = load_mask(mask_path, (h, w))
+        mask_rgb = np.stack([mask] * 3, axis=-1).astype(np.uint8)
+        overlay = apply_overlay(img_np, mask > 0)
+
+        panels = [
+            ("Input", img_np),
+            ("Mask", mask_rgb),
+            ("Overlay", overlay),
+        ]
+        titled = [add_title(arr, title, font) for title, arr in panels]
+        margin = 8
+        panel_widths = [img.size[0] for img in titled]
+        panel_heights = [img.size[1] for img in titled]
+        collage_w = sum(panel_widths) + margin * (len(titled) - 1)
+        collage_h = max(panel_heights)
+        collage = Image.new("RGB", (collage_w, collage_h), color=(0, 0, 0))
+        x = 0
+        for panel in titled:
+            collage.paste(panel, (x, 0))
+            x += panel.size[0] + margin
+        collage.save(outdir / f"{img_path.stem}_collage.png")
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     repo_root = Path(__file__).resolve().parent.parent
     default_roots = ["train_images", "supplemental_images", "test_images"]
@@ -210,6 +301,21 @@ def main(argv: Iterable[str] | None = None) -> int:
         update_acc(accs.get(group, accs["all"]), w, h, pixels)
 
     outdir.mkdir(parents=True, exist_ok=True)
+
+    train_forged_out = outdir / "train_forged_overlays"
+    supplemental_forged_out = outdir / "supplemental_forged_overlays"
+    save_forged_collages(
+        repo_root / "train_images" / "forged",
+        repo_root / "train_masks",
+        train_forged_out,
+        "train/forged",
+    )
+    save_forged_collages(
+        repo_root / "supplemental_images",
+        repo_root / "supplemental_masks",
+        supplemental_forged_out,
+        "supplemental",
+    )
 
     stats_all = compute_stats(accs["all"])
     stats_train = compute_stats(accs["train_supplement"])

@@ -11,6 +11,8 @@ Options:
 """
 
 import argparse
+import math
+import random
 import shutil
 from pathlib import Path
 
@@ -18,7 +20,7 @@ import numpy as np
 import pandas as pd
 import torch
 from PIL import Image, ImageDraw, ImageFont
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
 from tqdm import tqdm
 
@@ -75,17 +77,47 @@ def infer_fold(
     img_size: int,
     threshold: float,
     device: torch.device,
+    samples: int | None,
 ) -> None:
-    df = load_split(splits_dir, fold)
-    dataset = ForgedOnlyDataset(df, img_size=img_size)
-    loader = DataLoader(dataset, batch_size=2, shuffle=False, num_workers=2, pin_memory=True)
-
     if not weights_path.exists():
         raise FileNotFoundError(f"Missing weights for fold {fold}: {weights_path}")
 
-    model = DinoSegModel(model_name=model_name, pretrained=False, img_size=img_size).to(device)
     state = torch.load(weights_path, map_location=device)
-    model.load_state_dict(state["model_state"])
+    model_state = state["model_state"]
+
+    def infer_img_size_from_state(state_dict: dict, fallback: int) -> int:
+        pos_embed = state_dict.get("backbone.pos_embed")
+        patch_weight = state_dict.get("backbone.patch_embed.proj.weight")
+        if pos_embed is None or patch_weight is None:
+            return fallback
+        tokens = pos_embed.shape[1]
+        grid_tokens = tokens - 1
+        grid = int(math.sqrt(grid_tokens))
+        if grid * grid != grid_tokens:
+            return fallback
+        patch = int(patch_weight.shape[-1])
+        return grid * patch
+
+    inferred_img_size = infer_img_size_from_state(model_state, img_size)
+    if inferred_img_size != img_size:
+        print(
+            f"Adjusting img_size from {img_size} to {inferred_img_size} based on checkpoint pos_embed."
+        )
+        img_size = inferred_img_size
+
+    df = load_split(splits_dir, fold)
+    dataset = ForgedOnlyDataset(df, img_size=img_size)
+    if samples is not None:
+        if samples <= 0:
+            raise ValueError("--samples must be a positive integer.")
+        total = len(dataset)
+        pick = min(samples, total)
+        indices = random.sample(range(total), k=pick)
+        dataset = Subset(dataset, indices)
+    loader = DataLoader(dataset, batch_size=2, shuffle=False, num_workers=2, pin_memory=True)
+
+    model = DinoSegModel(model_name=model_name, pretrained=False, img_size=img_size).to(device)
+    model.load_state_dict(model_state)
     model.eval()
 
     fold_dir = outdir / f"fold_{fold}"
@@ -105,15 +137,30 @@ def infer_fold(
     with torch.no_grad():
         for images, case_ids, orig_sizes, mask_paths, image_paths in tqdm(loader, desc=f"Fold {fold}"):
             images = images.to(device, non_blocking=True)
-            logits = model(images)
+            logits, _ = model(images)
             probs = torch.sigmoid(logits)
-            masks = (probs > threshold).float().cpu().numpy()
+            masks = (probs >= threshold).float().cpu().numpy()
+            def parse_size(orig_size) -> tuple[int, int]:
+                if isinstance(orig_size, (list, tuple)) and len(orig_size) >= 2:
+                    return int(orig_size[0]), int(orig_size[1])
+                if torch.is_tensor(orig_size):
+                    flat = orig_size.flatten()
+                    if flat.numel() >= 2:
+                        return int(flat[0].item()), int(flat[1].item())
+                    if flat.numel() == 1:
+                        val = int(flat[0].item())
+                        return val, val
+                if isinstance(orig_size, np.ndarray):
+                    flat = orig_size.flatten()
+                    if flat.size >= 2:
+                        return int(flat[0]), int(flat[1])
+                    if flat.size == 1:
+                        val = int(flat[0])
+                        return val, val
+                raise ValueError(f"Unexpected orig_size format: {type(orig_size)}")
+
             for i, case_id in enumerate(case_ids):
-                orig_size = orig_sizes[i]
-                if isinstance(orig_size, (list, tuple)):
-                    w, h = int(orig_size[0]), int(orig_size[1])
-                else:  # fallback if tensor
-                    w, h = int(orig_size[0].item()), int(orig_size[1].item())
+                w, h = parse_size(orig_sizes[i])
 
                 mask = masks[i, 0]
                 mask_img = Image.fromarray((mask * 255).astype(np.uint8))
@@ -136,7 +183,9 @@ def infer_fold(
                 orig_img = orig_img.resize((w, h))
                 orig_np = np.array(orig_img)
 
-                pred_mask_rgb = np.stack([mask_resized * 255] * 3, axis=-1).astype(np.uint8)
+                # mask_resized is already 0/255 uint8; re-binarize to avoid overflow artifacts.
+                pred_mask_bin = (mask_resized > 0).astype(np.uint8) * 255
+                pred_mask_rgb = np.stack([pred_mask_bin] * 3, axis=-1).astype(np.uint8)
                 gt_mask_rgb = np.stack([gt_mask * 255] * 3, axis=-1).astype(np.uint8)
 
                 def apply_overlay(img_np: np.ndarray, mask_bin: np.ndarray, color=(255, 0, 0), alpha=0.5):
@@ -198,6 +247,7 @@ def main():
     parser.add_argument("--img-size", type=int, default=448, help="Image resize size.")
     parser.add_argument("--threshold", type=float, default=0.5, help="Probability threshold for masks.")
     parser.add_argument("--folds", nargs="*", type=int, default=None, help="Folds to run. Default: infer from weights.")
+    parser.add_argument("--samples", type=int, default=None, help="Randomly sample N images per fold.")
     args = parser.parse_args()
 
     weights_dir = Path(args.weights_dir)
@@ -236,6 +286,7 @@ def main():
             img_size=args.img_size,
             threshold=args.threshold,
             device=device,
+            samples=args.samples,
         )
 
 
