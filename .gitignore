@@ -1,0 +1,10 @@
+mlruns
+__pycache__
+supplemental_images
+supplemental_masks
+test_images
+train_images
+train_masks
+analysis/models
+analysis/preds
+analysis/splits
