@@ -43,7 +43,6 @@ class DinoSegModel(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(embed_dim // 2, num_classes, kernel_size=1),
         )
-        self.classifier_head = nn.Linear(embed_dim, 1)
 
     def _extract_tokens(self, feats: Any) -> torch.Tensor:
         """
@@ -80,5 +79,4 @@ class DinoSegModel(nn.Module):
         tokens = tokens.view(B, h_tokens, w_tokens, -1).permute(0, 3, 1, 2).contiguous()
         mask_logits = self.decode_head(tokens)
         mask_logits = F.interpolate(mask_logits, size=(H, W), mode="bilinear", align_corners=False)
-        class_logits = self.classifier_head(cls_token)
-        return mask_logits, class_logits
+        return mask_logits

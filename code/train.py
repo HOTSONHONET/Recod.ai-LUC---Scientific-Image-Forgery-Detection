@@ -107,24 +107,22 @@ class ForgeryDataset(Dataset):
         mask_tensor = transforms.functional.pil_to_tensor(mask_pil).float()
         mask_tensor = (mask_tensor > 0.5).float()
 
-        label = float(row.get("label", 0))
-        return image, mask_tensor, torch.tensor(label, dtype=torch.float32)
+        return image, mask_tensor
 
 
-def mask_bce_loss(
-    mask_logits: torch.Tensor,
-    targets: torch.Tensor,
-    labels: torch.Tensor,
-    auth_mask_weight: float,
-    pos_weight: float | None = None,
-) -> torch.Tensor:
+def bce_loss(mask_logits: torch.Tensor, targets: torch.Tensor, pos_weight: float | None = None) -> torch.Tensor:
     pw = None
     if pos_weight is not None:
         pw = torch.tensor(pos_weight, device=mask_logits.device, dtype=mask_logits.dtype)
-    loss_map = F.binary_cross_entropy_with_logits(mask_logits, targets, pos_weight=pw, reduction="none")
-    per_sample = loss_map.mean(dim=(1, 2, 3))
-    weights = torch.where(labels > 0.5, 1.0, auth_mask_weight).to(per_sample.dtype)
-    return (per_sample * weights).mean()
+    return F.binary_cross_entropy_with_logits(mask_logits, targets, pos_weight=pw)
+
+
+def dice_loss(mask_logits: torch.Tensor, targets: torch.Tensor, smooth: float = 1e-5) -> torch.Tensor:
+    probs = torch.sigmoid(mask_logits)
+    intersection = (probs * targets).sum(dim=(2, 3))
+    union = probs.sum(dim=(2, 3)) + targets.sum(dim=(2, 3))
+    dice = (2 * intersection + smooth) / (union + smooth)
+    return 1 - dice.mean()
 
 
 def dice_score(mask_logits: torch.Tensor, targets: torch.Tensor, smooth: float = 1e-5) -> torch.Tensor:
@@ -142,9 +140,6 @@ def train_one_epoch(
     scaler: GradScaler | None,
     device: torch.device,
     pos_weight: float | None = None,
-    auth_mask_weight: float = 0.1,
-    mask_loss_weight: float = 1.0,
-    cls_loss_weight: float = 1.0,
 ) -> Tuple[float, float]:
     model.train()
     total_loss = 0.0
@@ -152,19 +147,14 @@ def train_one_epoch(
     count = 0
     use_amp = scaler is not None and scaler.is_enabled()
     device_type = device.type
-    for images, masks, labels in tqdm(loader, desc="Train", leave=False):
+    for images, masks in tqdm(loader, desc="Train", leave=False):
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type=device_type, enabled=use_amp):
-            mask_logits, class_logits = model(images)
-            mask_loss = mask_bce_loss(
-                mask_logits, masks, labels, auth_mask_weight=auth_mask_weight, pos_weight=pos_weight
-            )
-            cls_loss = F.binary_cross_entropy_with_logits(class_logits.squeeze(1), labels)
-            loss = mask_loss * mask_loss_weight + cls_loss * cls_loss_weight
+            mask_logits = model(images)
+            loss = bce_loss(mask_logits, masks, pos_weight=pos_weight) + dice_loss(mask_logits, masks)
             dice = dice_score(mask_logits, masks)
         if use_amp and scaler is not None:
             scaler.scale(loss).backward()
@@ -186,25 +176,17 @@ def validate(
     loader: DataLoader,
     device: torch.device,
     pos_weight: float | None = None,
-    auth_mask_weight: float = 0.1,
-    mask_loss_weight: float = 1.0,
-    cls_loss_weight: float = 1.0,
 ) -> Tuple[float, float]:
     model.eval()
     total_loss = 0.0
     total_dice = 0.0
     count = 0
     with torch.no_grad():
-        for images, masks, labels in tqdm(loader, desc="Val", leave=False):
+        for images, masks in tqdm(loader, desc="Val", leave=False):
             images = images.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            mask_logits, class_logits = model(images)
-            mask_loss = mask_bce_loss(
-                mask_logits, masks, labels, auth_mask_weight=auth_mask_weight, pos_weight=pos_weight
-            )
-            cls_loss = F.binary_cross_entropy_with_logits(class_logits.squeeze(1), labels)
-            loss = mask_loss * mask_loss_weight + cls_loss * cls_loss_weight
+            mask_logits = model(images)
+            loss = bce_loss(mask_logits, masks, pos_weight=pos_weight) + dice_loss(mask_logits, masks)
             dice = dice_score(mask_logits, masks)
             total_loss += loss.item() * images.size(0)
             total_dice += dice.item() * images.size(0)
@@ -212,10 +194,16 @@ def validate(
     return total_loss / count, total_dice / count
 
 
-def prepare_splits(repo_root: Path, splits_dir: Path, n_splits: int = 5, seed: int = 42):
+def prepare_splits(
+    repo_root: Path,
+    splits_dir: Path,
+    n_splits: int = 5,
+    seed: int = 42,
+    include_supplemental: bool = True,
+):
     if splits_dir.exists() and list(splits_dir.glob("train_fold*.csv")):
         return
-    df = build_dataframe(repo_root)
+    df = build_dataframe(repo_root, include_supplemental=include_supplemental)
     folds = make_folds(df, n_splits=n_splits, seed=seed)
     save_folds(folds, splits_dir)
 
@@ -245,9 +233,13 @@ def main():
     parser.add_argument("--output-dir", default=Config.OUTPUT_DIR, help="Where to save model weights.")
     parser.add_argument("--seed", type=int, default=Config.SEED, help="Random seed.")
     parser.add_argument("--pos-weight", type=float, default=None, help="Positive class weight for BCE (e.g., 5.0).")
-    parser.add_argument("--auth-mask-weight", type=float, default=0.1, help="Mask loss weight for authentic images.")
-    parser.add_argument("--mask-loss-weight", type=float, default=1.0, help="Global weight for mask BCE loss.")
-    parser.add_argument("--cls-loss-weight", type=float, default=1.0, help="Global weight for classification BCE loss.")
+    parser.add_argument("--no-folds", action="store_true", help="Skip k-fold CV and train a single split.")
+    parser.add_argument(
+        "--use-supplemental",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include supplemental images in training.",
+    )
     args = parser.parse_args()
 
     repo_root = Path(args.repo_root).resolve()
@@ -261,14 +253,18 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_seed(args.seed)
-    prepare_splits(repo_root, splits_dir, n_splits=args.n_splits)
+    prepare_splits(
+        repo_root, splits_dir, n_splits=args.n_splits, seed=args.seed, include_supplemental=args.use_supplemental
+    )
 
     if args.mlflow_uri:
         mlflow.set_tracking_uri(args.mlflow_uri)
     experiment_name = f"{args.experiment_name}_{timestamp}"
     mlflow.set_experiment(experiment_name)
 
-    for fold in range(args.n_splits):
+    folds_to_run = [0] if args.no_folds else list(range(args.n_splits))
+
+    for fold in folds_to_run:
         train_df, val_df = load_fold(splits_dir, fold)
         train_ds = ForgeryDataset(train_df, img_size=args.img_size, augment=True)
         val_ds = ForgeryDataset(val_df, img_size=args.img_size, augment=False)
@@ -309,9 +305,8 @@ def main():
                     "PRETRAINED": not args.no_pretrained,
                     "SEED": args.seed,
                     "POS_WEIGHT": args.pos_weight,
-                    "AUTH_MASK_WEIGHT": args.auth_mask_weight,
-                    "MASK_LOSS_WEIGHT": args.mask_loss_weight,
-                    "CLS_LOSS_WEIGHT": args.cls_loss_weight,
+                    "NO_FOLDS": args.no_folds,
+                    "USE_SUPPLEMENTAL": args.use_supplemental,
                 }
             )
             mlflow.log_dict(run_cfg, "config_used.json")
@@ -326,9 +321,8 @@ def main():
                     "model_name": args.model_name,
                     "pretrained": not args.no_pretrained,
                     "pos_weight": args.pos_weight,
-                    "auth_mask_weight": args.auth_mask_weight,
-                    "mask_loss_weight": args.mask_loss_weight,
-                    "cls_loss_weight": args.cls_loss_weight,
+                    "no_folds": args.no_folds,
+                    "use_supplemental": args.use_supplemental,
                     "machine_specs": json.dumps({"ram_gb": 64, "cpu_cores": 16, "gpu": "RTX 5070 Ti"}),
                 }
             )
@@ -346,18 +340,12 @@ def main():
                     scaler,
                     device,
                     pos_weight=args.pos_weight,
-                    auth_mask_weight=args.auth_mask_weight,
-                    mask_loss_weight=args.mask_loss_weight,
-                    cls_loss_weight=args.cls_loss_weight,
                 )
                 val_loss, val_dice = validate(
                     model,
                     val_loader,
                     device,
                     pos_weight=args.pos_weight,
-                    auth_mask_weight=args.auth_mask_weight,
-                    mask_loss_weight=args.mask_loss_weight,
-                    cls_loss_weight=args.cls_loss_weight,
                 )
 
                 metrics = {

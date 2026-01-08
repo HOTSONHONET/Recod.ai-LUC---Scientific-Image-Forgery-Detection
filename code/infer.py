@@ -137,7 +137,8 @@ def infer_fold(
     with torch.no_grad():
         for images, case_ids, orig_sizes, mask_paths, image_paths in tqdm(loader, desc=f"Fold {fold}"):
             images = images.to(device, non_blocking=True)
-            logits, _ = model(images)
+            out = model(images)
+            logits = out if torch.is_tensor(out) else out[0]
             probs = torch.sigmoid(logits)
             masks = (probs >= threshold).float().cpu().numpy()
             def parse_size(orig_size) -> tuple[int, int]:
