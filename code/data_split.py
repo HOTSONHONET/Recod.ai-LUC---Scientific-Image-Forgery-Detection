@@ -11,6 +11,11 @@ from typing import Optional
 
 import pandas as pd
 from sklearn.model_selection import StratifiedGroupKFold
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 
 
 def build_dataframe(repo_root: Path, include_supplemental: bool = True) -> pd.DataFrame:
@@ -106,6 +111,27 @@ def save_folds(
     return paths
 
 
+def plot_fold_distributions(
+    folds: list[tuple[pd.DataFrame, pd.DataFrame]], out_dir: Path, prefix: str = ""
+) -> list[Path]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    for i, (train_df, val_df) in enumerate(folds):
+        fig, ax = plt.subplots(1, 2, figsize=(8, 3))
+        for a, df, title in zip(ax, (train_df, val_df), ("Train", "Val")):
+            counts = df["label"].value_counts().reindex([0, 1], fill_value=0)
+            a.bar(["authentic", "forged"], counts.values, color=["#4c78a8", "#f58518"])
+            a.set_title(f"{title} fold {i}")
+            a.set_ylabel("count")
+        fig.tight_layout()
+        pre = f"{prefix}_" if prefix else ""
+        path = out_dir / f"{pre}fold{i}_label_dist.png"
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        paths.append(path)
+    return paths
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create K-fold CSV splits for forgery dataset.")
     parser.add_argument("--repo-root", default=".", help="Repository root containing train_images/train_masks.")
@@ -113,6 +139,11 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--outdir", default="analysis/splits", help="Output directory for CSV files.")
     parser.add_argument("--prefix", default="", help="Optional prefix for file names.")
+    parser.add_argument(
+        "--plot-distribution",
+        action="store_true",
+        help="Plot authentic vs forged distributions per fold into analysis/.",
+    )
     args = parser.parse_args()
 
     repo_root = Path(args.repo_root).resolve()
@@ -120,6 +151,10 @@ def main() -> int:
     folds = make_folds(df, n_splits=args.n_splits, seed=args.seed)
     paths = save_folds(folds, Path(args.outdir), prefix=args.prefix)
     print(f"Built dataframe with {len(df)} rows; saved {len(paths)} folds to {args.outdir}")
+    if args.plot_distribution:
+        plot_dir = Path("analysis")
+        plot_paths = plot_fold_distributions(folds, plot_dir, prefix=args.prefix)
+        print(f"Saved {len(plot_paths)} distribution plots to {plot_dir}")
     return 0
 
 

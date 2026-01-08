@@ -6,8 +6,9 @@ test_images
 train_images
 train_masks
 analysis/models
-analysis/preds
+analysis/preds*
 analysis/splits
 analysis/preprocessed_*
 analysis/train_forged_overlays
 analysis/supplemental_forged_overlays
+mlartifacts

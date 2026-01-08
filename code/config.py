@@ -31,7 +31,7 @@ class Config:
 
     # Model
     MODEL = "dino_seg"
-    TIMM_MODEL = "vit_base_patch16_224.dino"
+    TIMM_MODEL = "vit_base_patch14_dinov2.lvd142m"
     IN_CHANNELS = 3
     DROPOUT = 0.1
     PRETRAINED = True

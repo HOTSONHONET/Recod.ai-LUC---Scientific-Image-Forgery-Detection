@@ -30,6 +30,10 @@ from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm import tqdm
+try:
+    import cv2  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    cv2 = None
 
 from config import Config, set_seed
 from data_split import build_dataframe, make_folds, save_folds
@@ -43,6 +47,20 @@ class ForgeryDataset(Dataset):
         self.augment = augment
         self.to_tensor = transforms.ToTensor()
         self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+    def _apply_clahe(self, image):
+        if cv2 is None:
+            raise RuntimeError("OpenCV (cv2) is required for CLAHE preprocessing.")
+        img_np = np.array(image)
+        lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l2 = clahe.apply(l)
+        lab = cv2.merge((l2, a, b))
+        enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+        from PIL import Image
+
+        return Image.fromarray(enhanced)
 
     def __len__(self) -> int:
         return len(self.df)
@@ -67,6 +85,8 @@ class ForgeryDataset(Dataset):
 
             image = Image.open(f).convert("RGB")
 
+        image = self._apply_clahe(image)
+
         w, h = image.size
         mask_np = self._load_mask(mask_path, target_size=(h, w))
         mask_pil = transforms.functional.to_pil_image(mask_np)
@@ -84,7 +104,7 @@ class ForgeryDataset(Dataset):
                 mask_pil = transforms.functional.vflip(mask_pil)
         image = self.normalize(self.to_tensor(image))
 
-        mask_tensor = transforms.functional.to_tensor(mask_pil).float()
+        mask_tensor = transforms.functional.pil_to_tensor(mask_pil).float()
         mask_tensor = (mask_tensor > 0.5).float()
 
         label = float(row.get("label", 0))
