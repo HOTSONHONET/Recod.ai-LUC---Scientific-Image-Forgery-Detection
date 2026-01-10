@@ -10,12 +10,13 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.model_selection import StratifiedGroupKFold, train_test_split
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from PIL import Image
 
 
 def build_dataframe(repo_root: Path, include_supplemental: bool = True) -> pd.DataFrame:
@@ -94,6 +95,39 @@ def make_folds(df: pd.DataFrame, n_splits: int = 5, seed: int = 42) -> list[tupl
     for train_idx, val_idx in sgkf.split(df, y, groups):
         folds.append((df.iloc[train_idx].reset_index(drop=True), df.iloc[val_idx].reset_index(drop=True)))
     return folds
+
+
+def _add_area_bins(df: pd.DataFrame, bins: int = 5) -> pd.DataFrame:
+    df = df.copy()
+    widths = []
+    heights = []
+    areas = []
+    for path in df["image_path"]:
+        with Image.open(path) as img:
+            w, h = img.size
+        widths.append(w)
+        heights.append(h)
+        areas.append(w * h)
+    df["width"] = widths
+    df["height"] = heights
+    df["area"] = areas
+    try:
+        df["area_bin"] = pd.qcut(df["area"], q=bins, labels=False, duplicates="drop")
+    except ValueError:
+        df["area_bin"] = pd.cut(df["area"], bins=bins, labels=False, include_lowest=True)
+    return df
+
+
+def make_area_stratified_split(
+    df: pd.DataFrame, bins: int = 5, val_ratio: float = 0.2, seed: int = 42
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    df = _add_area_bins(df, bins=bins)
+    train_idx, val_idx = train_test_split(
+        df.index, test_size=val_ratio, random_state=seed, stratify=df["area_bin"]
+    )
+    train_df = df.loc[train_idx].reset_index(drop=True)
+    val_df = df.loc[val_idx].reset_index(drop=True)
+    return train_df, val_df
 
 
 def save_folds(

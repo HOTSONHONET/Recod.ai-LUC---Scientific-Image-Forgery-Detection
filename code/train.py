@@ -36,8 +36,8 @@ except Exception:  # pragma: no cover - optional dependency
     cv2 = None
 
 from config import Config, set_seed
-from data_split import build_dataframe, make_folds, save_folds
-from model import DinoSegModel
+from data_split import build_dataframe, make_area_stratified_split, make_folds, save_folds
+from dinov2_seg import DinoSegModel
 
 
 class ForgeryDataset(Dataset):
@@ -194,18 +194,66 @@ def validate(
     return total_loss / count, total_dice / count
 
 
+def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+
 def prepare_splits(
     repo_root: Path,
     splits_dir: Path,
     n_splits: int = 5,
     seed: int = 42,
     include_supplemental: bool = True,
+    split_strategy: str = "kfold",
+    area_bins: int = 5,
+    val_ratio: float = 0.2,
 ):
+    meta_path = splits_dir / "split_meta.json"
     if splits_dir.exists() and list(splits_dir.glob("train_fold*.csv")):
+        if split_strategy == "area_bins":
+            if not meta_path.exists():
+                raise ValueError(
+                    f"Existing splits in {splits_dir} are missing split_meta.json; "
+                    "use a new --splits-dir for area_bins."
+                )
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            expected = {
+                "split_strategy": split_strategy,
+                "area_bins": area_bins,
+                "val_ratio": val_ratio,
+                "seed": seed,
+                "include_supplemental": include_supplemental,
+            }
+            mismatches = [
+                key for key, value in expected.items() if meta.get(key) != value
+            ]
+            if mismatches:
+                raise ValueError(
+                    f"Existing splits in {splits_dir} do not match requested area_bins config "
+                    f"(mismatched: {', '.join(mismatches)}); use a new --splits-dir."
+                )
         return
     df = build_dataframe(repo_root, include_supplemental=include_supplemental)
-    folds = make_folds(df, n_splits=n_splits, seed=seed)
+    if split_strategy == "kfold":
+        folds = make_folds(df, n_splits=n_splits, seed=seed)
+    elif split_strategy == "area_bins":
+        train_df, val_df = make_area_stratified_split(df, bins=area_bins, val_ratio=val_ratio, seed=seed)
+        folds = [(train_df, val_df)]
+    else:
+        raise ValueError(f"Unknown split_strategy: {split_strategy}")
     save_folds(folds, splits_dir)
+    meta = {
+        "split_strategy": split_strategy,
+        "area_bins": area_bins,
+        "val_ratio": val_ratio,
+        "n_splits": n_splits,
+        "seed": seed,
+        "include_supplemental": include_supplemental,
+    }
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, sort_keys=True)
 
 
 def load_fold(splits_dir: Path, fold: int) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -222,11 +270,35 @@ def main():
     parser.add_argument("--splits-dir", default=Config.TRAIN_CSV, help="Directory to read/write split CSVs.")
     parser.add_argument("--n-splits", type=int, default=Config.N_SPLITS, help="Number of folds.")
     parser.add_argument("--epochs", type=int, default=Config.EPOCHS, help="Epochs per fold.")
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=0,
+        help="Stop if val_dice doesn't improve for this many epochs (0 disables).",
+    )
     parser.add_argument("--batch-size", type=int, default=Config.BATCH, help="Batch size.")
     parser.add_argument("--lr", type=float, default=Config.LR, help="Learning rate.")
+    parser.add_argument(
+        "--lr-scheduler",
+        choices=["none", "cosine", "onecycle"],
+        default="none",
+        help="Learning rate schedule type.",
+    )
+    parser.add_argument("--warmup-epochs", type=int, default=0, help="Warmup epochs for cosine schedule.")
     parser.add_argument("--img-size", type=int, default=Config.IMG_SIZE, help="Square image size for training.")
     parser.add_argument("--num-workers", type=int, default=Config.NUM_WORKERS, help="Dataloader workers.")
+    parser.add_argument(
+        "--arch",
+        default=Config.MODEL,
+        choices=["dino_seg", "dinov2_uperhead", "dinov2_unet"],
+        help="Model architecture to train.",
+    )
     parser.add_argument("--model-name", default=Config.TIMM_MODEL, help="timm model name.")
+    parser.add_argument(
+        "--dinov2-id",
+        default="facebook/dinov2-base",
+        help="HuggingFace model id for DINOv2 when using dinov2_uperhead.",
+    )
     parser.add_argument("--no-pretrained", action="store_true", help="Disable pretrained weights.")
     parser.add_argument("--experiment-name", default=Config.EXPERIMENT_NAME, help="MLflow experiment name.")
     parser.add_argument("--mlflow-uri", default=None, help="Optional MLflow tracking URI (e.g., http://localhost:5000).")
@@ -234,6 +306,14 @@ def main():
     parser.add_argument("--seed", type=int, default=Config.SEED, help="Random seed.")
     parser.add_argument("--pos-weight", type=float, default=None, help="Positive class weight for BCE (e.g., 5.0).")
     parser.add_argument("--no-folds", action="store_true", help="Skip k-fold CV and train a single split.")
+    parser.add_argument(
+        "--split-strategy",
+        choices=["kfold", "area_bins"],
+        default="kfold",
+        help="Split strategy for train/val.",
+    )
+    parser.add_argument("--area-bins", type=int, default=5, help="Number of area bins for area_bins split.")
+    parser.add_argument("--val-ratio", type=float, default=0.2, help="Validation split ratio for area_bins split.")
     parser.add_argument(
         "--use-supplemental",
         action=argparse.BooleanOptionalAction,
@@ -253,8 +333,17 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_seed(args.seed)
+    if args.split_strategy == "area_bins" and not args.no_folds:
+        raise ValueError("split_strategy=area_bins requires --no-folds (single train/val split).")
     prepare_splits(
-        repo_root, splits_dir, n_splits=args.n_splits, seed=args.seed, include_supplemental=args.use_supplemental
+        repo_root,
+        splits_dir,
+        n_splits=args.n_splits,
+        seed=args.seed,
+        include_supplemental=args.use_supplemental,
+        split_strategy=args.split_strategy,
+        area_bins=args.area_bins,
+        val_ratio=args.val_ratio,
     )
 
     if args.mlflow_uri:
@@ -284,12 +373,45 @@ def main():
             pin_memory=True,
         )
 
-        model = DinoSegModel(model_name=args.model_name, pretrained=not args.no_pretrained, img_size=args.img_size)
+        if args.arch == "dino_seg":
+            model = DinoSegModel(model_name=args.model_name, pretrained=not args.no_pretrained, img_size=args.img_size)
+        elif args.arch == "dinov2_uperhead":
+            if args.img_size % 14 != 0:
+                raise ValueError("dinov2_uperhead requires img_size divisible by 14 (DINOv2 patch size).")
+            from dinov2_uperhead import DinoV2_UPerNet
+
+            model = DinoV2_UPerNet(dinov2_id=args.dinov2_id, num_classes=1)
+        elif args.arch == "dinov2_unet":
+            if args.img_size % 14 != 0:
+                raise ValueError("dinov2_unet requires img_size divisible by 14 (DINOv2 patch size).")
+            from dinov2_unet import DinoV2UNet
+
+            model = DinoV2UNet(dinov2_id=args.dinov2_id, out_classes=1)
+        else:
+            raise ValueError(f"Unknown arch: {args.arch}")
         model.to(device)
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
         use_amp = device.type == "cuda"
         scaler = GradScaler(enabled=use_amp) if use_amp else None
+        scheduler = None
+        warmup_epochs = max(0, int(args.warmup_epochs))
+        if args.lr_scheduler == "cosine":
+            if warmup_epochs >= args.epochs:
+                raise ValueError("--warmup-epochs must be < total epochs for cosine schedule.")
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=max(1, args.epochs - warmup_epochs)
+            )
+        elif args.lr_scheduler == "onecycle":
+            if warmup_epochs > 0:
+                print("Warning: --warmup-epochs is ignored for onecycle (use its internal warmup).")
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=args.lr,
+                epochs=args.epochs,
+                steps_per_epoch=len(train_loader),
+                pct_start=0.1,
+            )
 
         with mlflow.start_run(run_name=f"fold_{fold}", nested=False):
             run_cfg = Config.to_dict()
@@ -298,15 +420,23 @@ def main():
                     "EPOCHS": args.epochs,
                     "BATCH": args.batch_size,
                     "LR": args.lr,
+                    "LR_SCHEDULER": args.lr_scheduler,
+                    "WARMUP_EPOCHS": args.warmup_epochs,
+                    "EARLY_STOPPING_PATIENCE": args.early_stopping_patience,
                     "IMG_SIZE": args.img_size,
                     "NUM_WORKERS": args.num_workers,
                     "N_SPLITS": args.n_splits,
                     "TIMM_MODEL": args.model_name,
                     "PRETRAINED": not args.no_pretrained,
+                    "MODEL": args.arch,
+                    "DINOV2_ID": args.dinov2_id,
                     "SEED": args.seed,
                     "POS_WEIGHT": args.pos_weight,
                     "NO_FOLDS": args.no_folds,
                     "USE_SUPPLEMENTAL": args.use_supplemental,
+                    "SPLIT_STRATEGY": args.split_strategy,
+                    "AREA_BINS": args.area_bins,
+                    "VAL_RATIO": args.val_ratio,
                 }
             )
             mlflow.log_dict(run_cfg, "config_used.json")
@@ -317,22 +447,34 @@ def main():
                     "epochs": args.epochs,
                     "batch_size": args.batch_size,
                     "lr": args.lr,
+                    "lr_scheduler": args.lr_scheduler,
+                    "warmup_epochs": args.warmup_epochs,
+                    "early_stopping_patience": args.early_stopping_patience,
                     "img_size": args.img_size,
                     "model_name": args.model_name,
                     "pretrained": not args.no_pretrained,
+                    "arch": args.arch,
+                    "dinov2_id": args.dinov2_id,
                     "pos_weight": args.pos_weight,
                     "no_folds": args.no_folds,
                     "use_supplemental": args.use_supplemental,
+                    "split_strategy": args.split_strategy,
+                    "area_bins": args.area_bins,
+                    "val_ratio": args.val_ratio,
                     "machine_specs": json.dumps({"ram_gb": 64, "cpu_cores": 16, "gpu": "RTX 5070 Ti"}),
                 }
             )
             mlflow.log_artifacts(str(splits_dir), artifact_path="splits")
 
             best_dice = 0.0
+            epochs_since_best = 0
             best_path = output_dir / f"{Path(args.model_name).name}_fold{fold}.pt"
             history: list[dict] = []
 
             for epoch in range(1, args.epochs + 1):
+                if args.lr_scheduler == "cosine" and warmup_epochs > 0 and epoch <= warmup_epochs:
+                    warmup_lr = args.lr * (epoch / warmup_epochs)
+                    set_optimizer_lr(optimizer, warmup_lr)
                 train_loss, train_dice = train_one_epoch(
                     model,
                     train_loader,
@@ -341,12 +483,17 @@ def main():
                     device,
                     pos_weight=args.pos_weight,
                 )
+                if args.lr_scheduler == "onecycle" and scheduler is not None:
+                    scheduler.step()
+                elif args.lr_scheduler == "cosine" and scheduler is not None and epoch > warmup_epochs:
+                    scheduler.step()
                 val_loss, val_dice = validate(
                     model,
                     val_loader,
                     device,
                     pos_weight=args.pos_weight,
                 )
+                current_lr = optimizer.param_groups[0]["lr"]
 
                 metrics = {
                     f"train_loss_fold{fold}": train_loss,
@@ -357,6 +504,7 @@ def main():
                     "train_dice": train_dice,
                     "val_loss": val_loss,
                     "val_dice": val_dice,
+                    "lr": current_lr,
                 }
                 mlflow.log_metrics(metrics, step=epoch)
                 print(
@@ -376,8 +524,21 @@ def main():
 
                 if val_dice > best_dice:
                     best_dice = val_dice
+                    epochs_since_best = 0
                     torch.save({"model_state": model.state_dict(), "epoch": epoch}, best_path)
                     mlflow.log_artifact(str(best_path), artifact_path=f"fold_{fold}_weights")
+                    print(
+                        f"[Fold {fold}][Epoch {epoch}] new best val_dice={best_dice:.4f} 🎉 "
+                        f"(saved {best_path.name})"
+                    )
+                else:
+                    epochs_since_best += 1
+                    if args.early_stopping_patience > 0 and epochs_since_best >= args.early_stopping_patience:
+                        print(
+                            f"[Fold {fold}] early stopping after {epoch} epochs "
+                            f"(no val_dice improvement for {epochs_since_best} epochs)"
+                        )
+                        break
 
             mlflow.log_metric(f"best_val_dice_fold{fold}", best_dice)
 

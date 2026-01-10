@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
 from tqdm import tqdm
 
-from model import DinoSegModel
+from dinov2_seg import DinoSegModel
 
 
 class ForgedOnlyDataset(Dataset):
@@ -73,7 +73,9 @@ def infer_fold(
     weights_path: Path,
     splits_dir: Path,
     outdir: Path,
+    arch: str,
     model_name: str,
+    dinov2_id: str,
     img_size: int,
     threshold: float,
     device: torch.device,
@@ -98,12 +100,16 @@ def infer_fold(
         patch = int(patch_weight.shape[-1])
         return grid * patch
 
-    inferred_img_size = infer_img_size_from_state(model_state, img_size)
-    if inferred_img_size != img_size:
-        print(
-            f"Adjusting img_size from {img_size} to {inferred_img_size} based on checkpoint pos_embed."
-        )
-        img_size = inferred_img_size
+    if arch == "dino_seg":
+        inferred_img_size = infer_img_size_from_state(model_state, img_size)
+        if inferred_img_size != img_size:
+            print(
+                f"Adjusting img_size from {img_size} to {inferred_img_size} based on checkpoint pos_embed."
+            )
+            img_size = inferred_img_size
+    else:
+        if img_size % 14 != 0:
+            raise ValueError(f"{arch} requires img_size divisible by 14 (DINOv2 patch size).")
 
     df = load_split(splits_dir, fold)
     dataset = ForgedOnlyDataset(df, img_size=img_size)
@@ -116,7 +122,18 @@ def infer_fold(
         dataset = Subset(dataset, indices)
     loader = DataLoader(dataset, batch_size=2, shuffle=False, num_workers=2, pin_memory=True)
 
-    model = DinoSegModel(model_name=model_name, pretrained=False, img_size=img_size).to(device)
+    if arch == "dino_seg":
+        model = DinoSegModel(model_name=model_name, pretrained=False, img_size=img_size).to(device)
+    elif arch == "dinov2_uperhead":
+        from dinov2_uperhead import DinoV2_UPerNet
+
+        model = DinoV2_UPerNet(dinov2_id=dinov2_id, num_classes=1).to(device)
+    elif arch == "dinov2_unet":
+        from dinov2_unet import DinoV2UNet
+
+        model = DinoV2UNet(dinov2_id=dinov2_id, out_classes=1).to(device)
+    else:
+        raise ValueError(f"Unknown arch: {arch}")
     model.load_state_dict(model_state)
     model.eval()
 
@@ -244,7 +261,18 @@ def main():
     parser.add_argument("--weights-dir", default="analysis/models", help="Directory with saved fold weights.")
     parser.add_argument("--splits-dir", default="analysis/splits", help="Directory with train/val CSVs.")
     parser.add_argument("--outdir", default="analysis/preds", help="Where to save predicted masks.")
+    parser.add_argument(
+        "--arch",
+        choices=["dino_seg", "dinov2_uperhead", "dinov2_unet"],
+        default="dino_seg",
+        help="Model architecture to use for inference.",
+    )
     parser.add_argument("--model-name", default="vit_base_patch16_224.dino", help="timm model name.")
+    parser.add_argument(
+        "--dinov2-id",
+        default="facebook/dinov2-base",
+        help="HuggingFace model id for DINOv2 when using dinov2_uperhead or dinov2_unet.",
+    )
     parser.add_argument("--img-size", type=int, default=448, help="Image resize size.")
     parser.add_argument("--threshold", type=float, default=0.5, help="Probability threshold for masks.")
     parser.add_argument("--folds", nargs="*", type=int, default=None, help="Folds to run. Default: infer from weights.")
@@ -283,7 +311,9 @@ def main():
             weights_path=weight_path,
             splits_dir=splits_dir,
             outdir=outdir,
+            arch=args.arch,
             model_name=args.model_name,
+            dinov2_id=args.dinov2_id,
             img_size=args.img_size,
             threshold=args.threshold,
             device=device,
