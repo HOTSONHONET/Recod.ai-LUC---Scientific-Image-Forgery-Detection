@@ -19,7 +19,7 @@ import numpy as np
 from PIL import Image
 
 
-def build_dataframe(repo_root: Path, include_supplemental: bool = True) -> pd.DataFrame:
+def build_dataframe(repo_root: Path, include_supplemental: bool = True, include_synthetic: bool = True) -> pd.DataFrame:
     """
     Build a dataframe describing images and masks.
 
@@ -66,6 +66,24 @@ def build_dataframe(repo_root: Path, include_supplemental: bool = True) -> pd.Da
             }
         )
 
+    if include_synthetic:
+        synthetic_images = root / "synth_multipanel" / "images"
+        synthetic_masks = root / "synth_multipanel" / "masks"
+        for img_path in synthetic_images.glob("*.png"):
+            case_id = img_path.stem
+            mask_path = synthetic_masks / f"{case_id}.npy"
+            rows.append(
+                {
+                    "case_id": case_id,
+                    "image_path": str(img_path.resolve()),
+                    "mask_path": str(mask_path.resolve()) if mask_path.exists() else "",
+                    "label": 1 if mask_path.exists() else 0,
+                    "source": "synthetic",
+                    "variant": "synthentic_forged" if mask_path.exists() else "synthentic_authentic",
+                }
+            )
+
+
     if include_supplemental:
         supp_dir = root / "supplemental_images"
         supp_mask_dir = root / "supplemental_masks"
@@ -82,6 +100,7 @@ def build_dataframe(repo_root: Path, include_supplemental: bool = True) -> pd.Da
                     "variant": "supplemental_forged" if mask_path.exists() else "supplemental_authentic",
                 }
             )
+
 
     df = pd.DataFrame(rows)
     return df

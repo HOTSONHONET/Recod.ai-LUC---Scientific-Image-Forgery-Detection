@@ -13,3 +13,5 @@ analysis/train_forged_overlays
 analysis/supplemental_forged_overlays
 mlartifacts
 exps
+analysis/embeddings_data/
+synth_multipanel/

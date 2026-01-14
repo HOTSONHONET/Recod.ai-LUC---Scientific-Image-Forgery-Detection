@@ -41,12 +41,23 @@ from dinov2_seg import DinoSegModel
 
 
 class ForgeryDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, img_size: int = 448, augment: bool = False):
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        img_size: int = 448,
+        augment: bool = False,
+        processor=None,
+        include_synthetic=False,
+        include_supplemental=False,
+    ):
         self.df = df.reset_index(drop=True)
         self.img_size = img_size
         self.augment = augment
+        self.processor = processor
         self.to_tensor = transforms.ToTensor()
         self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        self.include_synthetic = include_synthetic
+        self.include_supplemental = include_supplemental
 
     def _apply_clahe(self, image):
         if cv2 is None:
@@ -85,7 +96,8 @@ class ForgeryDataset(Dataset):
 
             image = Image.open(f).convert("RGB")
 
-        image = self._apply_clahe(image)
+        if not (self.include_synthetic or self.include_supplemental):
+            image = self._apply_clahe(image)
 
         w, h = image.size
         mask_np = self._load_mask(mask_path, target_size=(h, w))
@@ -102,10 +114,25 @@ class ForgeryDataset(Dataset):
             if torch.rand(1).item() < 0.5:
                 image = transforms.functional.vflip(image)
                 mask_pil = transforms.functional.vflip(mask_pil)
-        image = self.normalize(self.to_tensor(image))
+        if self.processor is not None:
+            processed = self.processor(
+                images=image,
+                return_tensors="pt",
+                do_resize=False,
+                do_center_crop=False,
+                do_normalize=True,
+                do_rescale=True,
+            )
+            image = processed["pixel_values"].squeeze(0)
+        else:
+            image = self.normalize(self.to_tensor(image))
 
         mask_tensor = transforms.functional.pil_to_tensor(mask_pil).float()
         mask_tensor = (mask_tensor > 0.5).float()
+        if self.processor is not None:
+            _, h, w = image.shape
+            if mask_tensor.shape[-2:] != (h, w):
+                mask_tensor = F.interpolate(mask_tensor.unsqueeze(0), size=(h, w), mode="nearest").squeeze(0)
 
         return image, mask_tensor
 
@@ -208,6 +235,7 @@ def prepare_splits(
     split_strategy: str = "kfold",
     area_bins: int = 5,
     val_ratio: float = 0.2,
+    include_synthetic: bool = False,
 ):
     meta_path = splits_dir / "split_meta.json"
     if splits_dir.exists() and list(splits_dir.glob("train_fold*.csv")):
@@ -225,6 +253,7 @@ def prepare_splits(
                 "val_ratio": val_ratio,
                 "seed": seed,
                 "include_supplemental": include_supplemental,
+                "include_synthetic": include_synthetic,
             }
             mismatches = [
                 key for key, value in expected.items() if meta.get(key) != value
@@ -235,7 +264,7 @@ def prepare_splits(
                     f"(mismatched: {', '.join(mismatches)}); use a new --splits-dir."
                 )
         return
-    df = build_dataframe(repo_root, include_supplemental=include_supplemental)
+    df = build_dataframe(repo_root, include_supplemental=include_supplemental, include_synthetic = include_synthetic)
     if split_strategy == "kfold":
         folds = make_folds(df, n_splits=n_splits, seed=seed)
     elif split_strategy == "area_bins":
@@ -251,6 +280,7 @@ def prepare_splits(
         "n_splits": n_splits,
         "seed": seed,
         "include_supplemental": include_supplemental,
+        "include_synthetic": include_synthetic,
     }
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, sort_keys=True)
@@ -290,14 +320,31 @@ def main():
     parser.add_argument(
         "--arch",
         default=Config.MODEL,
-        choices=["dino_seg", "dinov2_uperhead", "dinov2_unet"],
+        choices=["dino_seg", "dinov2_uperhead", "dinov2_unet", "medsam"],
         help="Model architecture to train.",
     )
     parser.add_argument("--model-name", default=Config.TIMM_MODEL, help="timm model name.")
     parser.add_argument(
         "--dinov2-id",
         default="facebook/dinov2-base",
-        help="HuggingFace model id for DINOv2 when using dinov2_uperhead.",
+        help="HuggingFace model id for DINOv2 when using dinov2_uperhead/dinov2_unet.",
+    )
+    parser.add_argument(
+        "--medsam-id",
+        default="flaviagiammarino/medsam-vit-base",
+        help="HuggingFace model id for MedSAM when using medsam.",
+    )
+    parser.add_argument(
+        "--freeze-backbone",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Freeze backbone weights during training.",
+    )
+    parser.add_argument(
+        "--use-hf-processor",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use HuggingFace AutoImageProcessor for transformer architectures.",
     )
     parser.add_argument("--no-pretrained", action="store_true", help="Disable pretrained weights.")
     parser.add_argument("--experiment-name", default=Config.EXPERIMENT_NAME, help="MLflow experiment name.")
@@ -319,6 +366,12 @@ def main():
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Include supplemental images in training.",
+    )
+    parser.add_argument(
+        "--use-synthetic",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include synthetic multi-panel dataset in training.",
     )
     args = parser.parse_args()
 
@@ -344,6 +397,7 @@ def main():
         split_strategy=args.split_strategy,
         area_bins=args.area_bins,
         val_ratio=args.val_ratio,
+        include_synthetic=args.use_synthetic,
     )
 
     if args.mlflow_uri:
@@ -353,10 +407,34 @@ def main():
 
     folds_to_run = [0] if args.no_folds else list(range(args.n_splits))
 
+    use_hf_processor = args.use_hf_processor
+    if use_hf_processor is None:
+        use_hf_processor = args.arch != "dino_seg"
+    hf_processor = None
+    if use_hf_processor:
+        from transformers import AutoImageProcessor
+
+        processor_id = args.medsam_id if args.arch == "medsam" else args.dinov2_id
+        hf_processor = AutoImageProcessor.from_pretrained(processor_id)
+
     for fold in folds_to_run:
         train_df, val_df = load_fold(splits_dir, fold)
-        train_ds = ForgeryDataset(train_df, img_size=args.img_size, augment=True)
-        val_ds = ForgeryDataset(val_df, img_size=args.img_size, augment=False)
+        train_ds = ForgeryDataset(
+            train_df,
+            img_size=args.img_size,
+            augment=True,
+            processor=hf_processor,
+            include_supplemental=args.use_supplemental,
+            include_synthetic=args.use_synthetic,
+        )
+        val_ds = ForgeryDataset(
+            val_df,
+            img_size=args.img_size,
+            augment=False,
+            processor=hf_processor,
+            include_supplemental=args.use_supplemental,
+            include_synthetic=args.use_synthetic,
+        )
 
         train_loader = DataLoader(
             train_ds,
@@ -367,7 +445,7 @@ def main():
         )
         val_loader = DataLoader(
             val_ds,
-            batch_size=args.batch_size,
+            batch_size=args.batch_size * 2,
             shuffle=False,
             num_workers=args.num_workers,
             pin_memory=True,
@@ -387,11 +465,32 @@ def main():
             from dinov2_unet import DinoV2UNet
 
             model = DinoV2UNet(dinov2_id=args.dinov2_id, out_classes=1)
+        elif args.arch == "medsam":
+            from medsam_seg import MedSAMSegModel
+
+            model = MedSAMSegModel(model_id=args.medsam_id, out_classes=1)
         else:
             raise ValueError(f"Unknown arch: {args.arch}")
         model.to(device)
+        if args.freeze_backbone:
+            if args.arch == "dino_seg":
+                for p in model.backbone.parameters():
+                    p.requires_grad = False
+                model.backbone.eval()
+            elif args.arch == "dinov2_uperhead":
+                for p in model.backbone.encoder.parameters():
+                    p.requires_grad = False
+                model.backbone.encoder.eval()
+            elif args.arch == "dinov2_unet":
+                model.backbone.freeze()
+                model.backbone.encoder.eval()
+            elif args.arch == "medsam":
+                for p in model.encoder.parameters():
+                    p.requires_grad = False
+                model.encoder.eval()
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-4)
         use_amp = device.type == "cuda"
         scaler = GradScaler(enabled=use_amp) if use_amp else None
         scheduler = None
@@ -430,6 +529,7 @@ def main():
                     "PRETRAINED": not args.no_pretrained,
                     "MODEL": args.arch,
                     "DINOV2_ID": args.dinov2_id,
+                    "MEDSAM_ID": args.medsam_id,
                     "SEED": args.seed,
                     "POS_WEIGHT": args.pos_weight,
                     "NO_FOLDS": args.no_folds,
@@ -437,6 +537,8 @@ def main():
                     "SPLIT_STRATEGY": args.split_strategy,
                     "AREA_BINS": args.area_bins,
                     "VAL_RATIO": args.val_ratio,
+                    "USE_HF_PROCESSOR": use_hf_processor,
+                    "FREEZE_BACKBONE": args.freeze_backbone,
                 }
             )
             mlflow.log_dict(run_cfg, "config_used.json")
@@ -455,12 +557,15 @@ def main():
                     "pretrained": not args.no_pretrained,
                     "arch": args.arch,
                     "dinov2_id": args.dinov2_id,
+                    "medsam_id": args.medsam_id,
                     "pos_weight": args.pos_weight,
                     "no_folds": args.no_folds,
                     "use_supplemental": args.use_supplemental,
                     "split_strategy": args.split_strategy,
                     "area_bins": args.area_bins,
                     "val_ratio": args.val_ratio,
+                    "use_hf_processor": use_hf_processor,
+                    "freeze_backbone": args.freeze_backbone,
                     "machine_specs": json.dumps({"ram_gb": 64, "cpu_cores": 16, "gpu": "RTX 5070 Ti"}),
                 }
             )
@@ -468,7 +573,8 @@ def main():
 
             best_dice = 0.0
             epochs_since_best = 0
-            best_path = output_dir / f"{Path(args.model_name).name}_fold{fold}.pt"
+            model_tag = Path(args.medsam_id).name if args.arch == "medsam" else Path(args.model_name).name
+            best_path = output_dir / f"{model_tag}_fold{fold}.pt"
             history: list[dict] = []
 
             for epoch in range(1, args.epochs + 1):
