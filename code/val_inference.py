@@ -45,14 +45,20 @@ from utils import evaluate_single_image, rle_encode, score as competition_score
 # ============================================================
 # Toggle this here (NOT a CLI arg)
 # ============================================================
-SAVE_COLLAGES = False  # set True when you want collages
+SAVE_COLLAGES = True  # set True when you want collages
 
 
 # -------------------------
 # Dataset
 # -------------------------
 class InferenceDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, img_size: int, processor=None):
+    def __init__(
+        self, 
+        df: pd.DataFrame, 
+        img_size: int, processor=None,
+        include_synthetic=False,
+        include_supplemental=False,
+    ):
         self.df = df.reset_index(drop=True)
         self.img_size = img_size
         self.processor = processor
@@ -67,6 +73,20 @@ class InferenceDataset(Dataset):
             self.to_tensor,
             self.normalize,
         ])
+        self.include_synthetic = include_synthetic
+        self.include_supplemental = include_supplemental
+
+    def _apply_clahe(self, image):
+        if cv2 is None:
+            raise RuntimeError("OpenCV (cv2) is required for CLAHE preprocessing.")
+        img_np = np.array(image)
+        lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l2 = clahe.apply(l)
+        lab = cv2.merge((l2, a, b))
+        enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+        from PIL import Image
 
     def __len__(self):
         return len(self.df)
@@ -80,6 +100,9 @@ class InferenceDataset(Dataset):
         with open(image_path, "rb") as f:
             img = Image.open(f).convert("RGB")
         orig_size = img.size  # (W,H)
+
+        if not (self.include_synthetic or self.include_supplemental):
+            image = self._apply_clahe(image)
 
         if self.processor is not None:
             img_rs = transforms.functional.resize(img, (self.img_size, self.img_size))
@@ -263,6 +286,8 @@ def run_pipeline(
     img_size: int,
     device: torch.device,
     hf_processor,
+    include_supplemental:bool,
+    include_synthetic: bool,
 ):
     # -------- checkpoint
     state = torch.load(weights_path, map_location=device)
@@ -278,7 +303,13 @@ def run_pipeline(
             raise ValueError(f"{arch} requires img_size divisible by 14.")
 
     # -------- dataset/loader
-    dataset = InferenceDataset(df, img_size=img_size, processor=hf_processor)
+    dataset = InferenceDataset(
+        df,
+        img_size=img_size,
+        processor=hf_processor,
+        include_supplemental = include_supplemental,
+        include_synthetic = include_synthetic,
+    )
     loader = DataLoader(
         dataset,
         batch_size=2,
@@ -528,6 +559,18 @@ def main():
     parser.add_argument("--use-hf-processor", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--img-size", type=int, default=532, help="Resize size")
     parser.add_argument("--csv-path", type=str, required=True, help="CSV path (must include image_path, case_id, label)")
+    parser.add_argument(
+        "--use-supplemental",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include supplemental images in training.",
+    )
+    parser.add_argument(
+        "--use-synthetic",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include synthetic multi-panel dataset in training.",
+    )
 
     args = parser.parse_args()
 
@@ -562,6 +605,8 @@ def main():
         img_size=args.img_size,
         device=device,
         hf_processor=hf_processor,
+        include_supplemental=args.use_supplemental,
+        include_synthetic=args.use_synthetic,
     )
 
     (outdir / "analysis" / "args.json").write_text(json.dumps(vars(args), indent=2))
