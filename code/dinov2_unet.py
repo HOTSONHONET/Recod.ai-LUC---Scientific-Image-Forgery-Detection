@@ -93,6 +93,9 @@ class DinoV2HookBackbone(nn.Module):
 
     def _make_hook(self, idx: int):
         def hook(module, inp, out):
+            # HF blocks can return tuples; keep the hidden states tensor.
+            if isinstance(out, (list, tuple)):
+                out = out[0]
             self._feats[idx] = out
 
         return hook

@@ -9,7 +9,7 @@ from typing import Any, Dict
 import numpy as np
 import torch
 
-from model import DinoSegModel
+from dinov2_seg import DinoSegModel
 
 
 class Config:
