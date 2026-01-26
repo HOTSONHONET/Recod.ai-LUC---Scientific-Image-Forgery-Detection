@@ -271,7 +271,7 @@ in **submission.csv.**
 ## 15. UPerNet architecture (visual)
 
 <p align="center">
-  <img src="assets/recodai-yolo-dinov2-inference-seg-....png" width="900"/>
+  <img src="assets/recodai-yolo-dinov2-inference-seg-model.png" width="900"/>
   <br/>
   <em>DINOv2 backbone with UPerNet decode head (PSP + FPN).</em>
 </p>
