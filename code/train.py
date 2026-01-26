@@ -38,26 +38,64 @@ except Exception:  # pragma: no cover - optional dependency
 from config import Config, set_seed
 from data_split import build_dataframe, make_area_stratified_split, make_folds, save_folds
 from dinov2_seg import DinoSegModel
-
+import random
+from torchvision.transforms import InterpolationMode
+import io
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 class ForgeryDataset(Dataset):
     def __init__(
         self,
-        df: pd.DataFrame,
+        df,
         img_size: int = 448,
         augment: bool = False,
         processor=None,
-        include_synthetic=False,
-        include_supplemental=False,
+        include_synthetic: bool = False,
+        include_supplemental: bool = False,
+        # augmentation knobs
+        jpeg_p: float = 0.35,
+        jpeg_qmin: int = 35,
+        jpeg_qmax: int = 95,
+        blur_p: float = 0.35,
+        sharp_p: float = 0.25,
+        color_p: float = 0.35,
+        resize_jitter_p: float = 0.8,
+        affine_p: float = 0.20,
+        seed: int = 1337,
     ):
         self.df = df.reset_index(drop=True)
         self.img_size = img_size
         self.augment = augment
         self.processor = processor
-        self.to_tensor = transforms.ToTensor()
-        self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         self.include_synthetic = include_synthetic
         self.include_supplemental = include_supplemental
+
+        self.to_tensor = transforms.ToTensor()
+        self.normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )
+
+        # probs
+        self.jpeg_p = jpeg_p
+        self.jpeg_qmin = jpeg_qmin
+        self.jpeg_qmax = jpeg_qmax
+        self.blur_p = blur_p
+        self.sharp_p = sharp_p
+        self.color_p = color_p
+        self.resize_jitter_p = resize_jitter_p
+        self.affine_p = affine_p
+
+        # deterministic randomness per worker if you want (optional)
+        self.rng = random.Random(seed)
+
+        # photometric ops (image only)
+        self.color_jitter = transforms.ColorJitter(
+            brightness=0.15, contrast=0.20, saturation=0.10, hue=0.02
+        )
+        # Gaussian blur: kernel size must be odd
+        self.gauss_blur = transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))
 
     def _apply_clahe(self, image):
         if cv2 is None:
@@ -70,50 +108,148 @@ class ForgeryDataset(Dataset):
         lab = cv2.merge((l2, a, b))
         enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
         from PIL import Image
-
         return Image.fromarray(enhanced)
 
     def __len__(self) -> int:
         return len(self.df)
 
-    def _load_mask(self, mask_path: str, target_size: Tuple[int, int]) -> np.ndarray:
-        if not mask_path or not Path(mask_path).exists():
-            return np.zeros(target_size, dtype=np.float32)
+    def _load_mask(self, mask_path: str, target_size_hw: Tuple[int, int]) -> np.ndarray:
+        """
+        Returns uint8 mask in {0,255} with shape (H,W).
+        """
+        H, W = target_size_hw
+        if (not mask_path) or (not Path(mask_path).exists()):
+            return np.zeros((H, W), dtype=np.uint8)
 
         arr = np.load(mask_path, allow_pickle=True)
         if arr.ndim == 3:
             arr = arr.max(axis=0)
-        mask = arr.astype(np.float32)
+
+        # ensure HxW
+        mask = (arr > 0).astype(np.uint8) * 255
+        if mask.shape[:2] != (H, W):
+            # shouldn't happen if mask matches image, but keep safe
+            if cv2 is not None:
+                mask = cv2.resize(mask, (W, H), interpolation=cv2.INTER_NEAREST)
+            else:
+                # fallback: just crop/pad (rare)
+                mask = mask[:H, :W]
         return mask
+
+    def _random_jpeg(self, pil_img):
+        """
+        Simulate re-save artifacts from panels/screenshots.
+        """
+        # ensure valid mode for JPEG
+        if pil_img.mode != "RGB":
+            pil_img = pil_img.convert("RGB")
+
+        q = int(np.random.randint(35, 96))  # choose your range
+        buf = io.BytesIO()
+
+        # IMPORTANT: avoid optimize=True and subsampling=0 (can trigger fp.fileno path / encoder issues)
+        pil_img.save(buf, format="JPEG", quality=q)
+
+        buf.seek(0)
+        out = Image.open(buf).convert("RGB")
+        out.load()  # force decode now (so worker doesn't hold lazy file handle)
+        return out
+
+    def _resize_jitter(self, img, mask_pil):
+        """
+        Simulate crop->resize blur by:
+        - resizing to random intermediate size
+        - using random interpolation
+        - resizing back to img_size
+        """
+        S = self.img_size
+        # jitter scale (mild but effective)
+        scale = self.rng.uniform(0.75, 1.30)
+        t = max(64, int(S * scale))
+
+        interps = [
+            InterpolationMode.BILINEAR,
+            InterpolationMode.BICUBIC,
+            InterpolationMode.LANCZOS,
+            InterpolationMode.NEAREST,  # include sometimes (panels can be rough)
+        ]
+        interp = self.rng.choice(interps)
+
+        img = transforms.functional.resize(img, (t, t), interpolation=interp)
+        mask_pil = transforms.functional.resize(mask_pil, (t, t), interpolation=InterpolationMode.NEAREST)
+
+        # back to target
+        img = transforms.functional.resize(img, (S, S), interpolation=interp)
+        mask_pil = transforms.functional.resize(mask_pil, (S, S), interpolation=InterpolationMode.NEAREST)
+        return img, mask_pil
 
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]
         image_path = row["image_path"]
         mask_path = row.get("mask_path", "")
 
+        from PIL import Image
         with open(image_path, "rb") as f:
-            from PIL import Image
-
             image = Image.open(f).convert("RGB")
 
-        if not (self.include_synthetic or self.include_supplemental):
-            image = self._apply_clahe(image)
+        # NOTE: if later you decide "no CLAHE", just comment this line
+        image = self._apply_clahe(image)
 
-        w, h = image.size
-        mask_np = self._load_mask(mask_path, target_size=(h, w))
-        mask_pil = transforms.functional.to_pil_image(mask_np)
+        W, H = image.size
+        mask_u8 = self._load_mask(mask_path, target_size_hw=(H, W))
+        mask_pil = Image.fromarray(mask_u8)  # mode 'L'
 
-        image = transforms.functional.resize(image, (self.img_size, self.img_size))
-        mask_pil = transforms.functional.resize(
-            mask_pil, (self.img_size, self.img_size), transforms.InterpolationMode.NEAREST
-        )
+        # base resize to model size
+        image = transforms.functional.resize(image, (self.img_size, self.img_size), interpolation=InterpolationMode.BICUBIC)
+        mask_pil = transforms.functional.resize(mask_pil, (self.img_size, self.img_size), interpolation=InterpolationMode.NEAREST)
+
         if self.augment:
+            # flips
             if torch.rand(1).item() < 0.5:
                 image = transforms.functional.hflip(image)
                 mask_pil = transforms.functional.hflip(mask_pil)
             if torch.rand(1).item() < 0.5:
                 image = transforms.functional.vflip(image)
                 mask_pil = transforms.functional.vflip(mask_pil)
+
+            # resize/interpolation jitter (best for your blur issue)
+            if torch.rand(1).item() < self.resize_jitter_p:
+                image, mask_pil = self._resize_jitter(image, mask_pil)
+
+            # mild affine (keep small to avoid label damage)
+            if torch.rand(1).item() < self.affine_p:
+                # degrees small, translate small, scale small
+                angle = float(self.rng.uniform(-5.0, 5.0))
+                translate = (int(self.rng.uniform(-0.02, 0.02) * self.img_size),
+                             int(self.rng.uniform(-0.02, 0.02) * self.img_size))
+                scale = float(self.rng.uniform(0.95, 1.05))
+                shear = float(self.rng.uniform(-2.0, 2.0))
+
+                image = transforms.functional.affine(
+                    image, angle=angle, translate=translate, scale=scale, shear=[shear, 0.0],
+                    interpolation=InterpolationMode.BICUBIC, fill=255
+                )
+                mask_pil = transforms.functional.affine(
+                    mask_pil, angle=angle, translate=translate, scale=scale, shear=[shear, 0.0],
+                    interpolation=InterpolationMode.NEAREST, fill=0
+                )
+
+            # photometric / degradation (image only)
+            if torch.rand(1).item() < self.color_p:
+                image = self.color_jitter(image)
+
+            if torch.rand(1).item() < self.blur_p:
+                image = self.gauss_blur(image)
+
+            if torch.rand(1).item() < self.sharp_p:
+                # factor <1 softens, >1 sharpens; jitter around sharpness
+                factor = float(self.rng.uniform(0.5, 2.0))
+                image = transforms.functional.adjust_sharpness(image, sharpness_factor=factor)
+
+            if torch.rand(1).item() < self.jpeg_p:
+                image = self._random_jpeg(image)
+
+        # to tensor / normalize or HF processor
         if self.processor is not None:
             processed = self.processor(
                 images=image,
@@ -123,18 +259,21 @@ class ForgeryDataset(Dataset):
                 do_normalize=True,
                 do_rescale=True,
             )
-            image = processed["pixel_values"].squeeze(0)
+            image_t = processed["pixel_values"].squeeze(0)
         else:
-            image = self.normalize(self.to_tensor(image))
+            image_t = self.normalize(self.to_tensor(image))
 
-        mask_tensor = transforms.functional.pil_to_tensor(mask_pil).float()
-        mask_tensor = (mask_tensor > 0.5).float()
+        # mask tensor (0/1)
+        mask_tensor = transforms.functional.pil_to_tensor(mask_pil).float() / 255.0
+        mask_tensor = (mask_tensor > 0.5).float()  # (1,H,W)
+
+        # if HF processor output size differs, align mask
         if self.processor is not None:
-            _, h, w = image.shape
-            if mask_tensor.shape[-2:] != (h, w):
-                mask_tensor = F.interpolate(mask_tensor.unsqueeze(0), size=(h, w), mode="nearest").squeeze(0)
+            _, h2, w2 = image_t.shape
+            if mask_tensor.shape[-2:] != (h2, w2):
+                mask_tensor = F.interpolate(mask_tensor.unsqueeze(0), size=(h2, w2), mode="nearest").squeeze(0)
 
-        return image, mask_tensor
+        return image_t, mask_tensor
 
 
 def bce_loss(mask_logits: torch.Tensor, targets: torch.Tensor, pos_weight: float | None = None) -> torch.Tensor:

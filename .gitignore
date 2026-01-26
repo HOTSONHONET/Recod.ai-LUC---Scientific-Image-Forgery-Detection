@@ -15,3 +15,5 @@ mlartifacts
 exps
 analysis/embeddings_data/
 synth_multipanel/
+runs
+panel_detect_dataset/
