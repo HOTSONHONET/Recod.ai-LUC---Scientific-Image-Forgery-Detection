@@ -4,5 +4,6 @@
   "n_splits": 5,
   "seed": 42,
   "split_strategy": "area_bins",
-  "val_ratio": 0.2
+  "val_ratio": 0.2,
+  "include_synthetic": false
 }

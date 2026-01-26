@@ -1,0 +1,17 @@
+{
+  "csv_path": "analysis/area_splits/val_fold0.csv",
+  "outdir": "analysis/yolo_grid_uperhead_aug",
+  "detector_weights": "runs/detect/train/weights/best.pt",
+  "seg_weights": "exps/20260115_182834/vit_base_patch14_dinov2.lvd142m_fold0.pt",
+  "arch": "dinov2_uperhead",
+  "dinov2_id": "facebook/dinov2-base",
+  "img_size": 532,
+  "margin": 20,
+  "yolo_img_size": 1024,
+  "yolo_conf": 0.25,
+  "yolo_iou": 0.6,
+  "use_area_ratio": true,
+  "cc_range": "0,50,100,200,400,800,1000",
+  "mean_range": "0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70,0.75,0.80,0.85",
+  "area_range": "5e-5,1e-4,2e-4,3e-4,5e-4,8e-4,1e-3,1.5e-3,2e-3,3e-3,5e-3,8e-3,1e-2"
+}

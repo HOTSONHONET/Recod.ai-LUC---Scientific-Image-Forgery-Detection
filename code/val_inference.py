@@ -86,7 +86,7 @@ class InferenceDataset(Dataset):
         l2 = clahe.apply(l)
         lab = cv2.merge((l2, a, b))
         enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-        from PIL import Image
+        return Image.fromarray(enhanced)
 
     def __len__(self):
         return len(self.df)
@@ -101,8 +101,7 @@ class InferenceDataset(Dataset):
             img = Image.open(f).convert("RGB")
         orig_size = img.size  # (W,H)
 
-        if not (self.include_synthetic or self.include_supplemental):
-            image = self._apply_clahe(image)
+        img = self._apply_clahe(img)
 
         if self.processor is not None:
             img_rs = transforms.functional.resize(img, (self.img_size, self.img_size))
@@ -379,7 +378,7 @@ def run_pipeline(
 
     # -------- grid ranges
     area_range = [i * 100 for i in range(1, 11)]
-    mean_range = [round(x, 2) for x in np.arange(0.20, 0.9, 0.05)]
+    mean_range = [round(x, 2) for x in np.arange(0.4, 0.9, 0.05)]
     cc_range = [0, 50, 100, 200, 400, 800, 850, 900, 950, 1000]
 
     combos_2d = list(itertools.product(area_range, mean_range))
