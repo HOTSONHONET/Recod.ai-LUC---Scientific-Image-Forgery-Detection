@@ -268,6 +268,15 @@ in **submission.csv.**
 
 ## 15. UPerNet architecture (visual)
 
+## 15. UPerNet architecture (visual)
+
+<p align="center">
+  <img src="assets/recodai-yolo-dinov2-inference-seg-....png" width="900"/>
+  <br/>
+  <em>DINOv2 backbone with UPerNet decode head (PSP + FPN).</em>
+</p>
+
+
 ```mermaid
 flowchart TB
     I[Input Image] --> D[DINOv2 Backbone]
