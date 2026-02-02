@@ -1,0 +1,26 @@
+[project]
+name = "kaggle-work"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "albumentationsx[gui]>=2.0.14",
+    "fastparquet>=2024.11.0",
+    "kaggle>=1.7.4.5",
+    "lightgbm>=4.6.0",
+    "matplotlib>=3.10.5",
+    "mlflow>=3.6.0",
+    "numba>=0.63.1",
+    "numpy>=2.3.2",
+    "opencv-contrib-python>=4.11.0.86",
+    "pandas>=2.3.1",
+    "pyarrow>=22.0.0",
+    "seaborn>=0.13.2",
+    "shapely>=2.1.2",
+    "timm>=1.0.20",
+    "torch>=2.8.0",
+    "transformers>=4.55.0",
+    "ultralytics>=8.4.2",
+    "xgboost>=3.1.3",
+]
